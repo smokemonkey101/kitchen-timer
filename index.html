@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kitchen Timer System</title>
+  <!-- Tailwind CSS CDN for quick prototype -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* Safe padding for tablets with notches */
+    .p-safe { padding-bottom: env(safe-area-inset-bottom); padding-top: env(safe-area-inset-top); }
+  </style>
+</head>
+<body class="bg-neutral-950 text-neutral-100">
+  <div id="root"></div>
+
+  <!-- React 18 + ReactDOM -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <!-- Babel for JSX -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- App code -->
+  <script type="text/babel">
+    const { useEffect, useMemo, useRef, useState } = React;
+
+    const DEFAULT_TABLE_COUNT = 10;
+    const MAX_STATUSES = 15;
+    const LS_KEYS = {
+      COURSES: "KHS_COURSES",
+      TABLES: "KHS_TABLES",
+      ASSIGN: "KHS_ASSIGNMENTS",
+    };
+
+    function makeId(prefix = "id") {
+      return `${prefix}_${Math.random().toString(36).slice(2, 8)}_${Date.now().toString(36)}`;
+    }
+
+    function makeDefaultCourse() {
+      return {
+        id: makeId("course"),
+        name: "Default Course",
+        statuses: [
+          { id: makeId("st"), status: "Received", mode: "timer", alertAtSec: 300, message: "Order received" },
+          { id: makeId("st"), status: "Prep", mode: "timer", alertAtSec: 600, message: "Prep in progress" },
+          { id: makeId("st"), status: "Cook", mode: "countdown", durationSec: 600, alertAtSec: 120, message: "Finish cooking soon" },
+          { id: makeId("st"), status: "Plate", mode: "timer", alertAtSec: 180, message: "Plating" },
+          { id: makeId("st"), status: "Serve", mode: "timer", alertAtSec: 120, message: "Ready to serve" },
+        ],
+      };
+    }
+
+    function makeDefaultTableState(i) {
+      return { tableIndex: i, courseId: undefined, statusIndex: 0, startedAt: undefined, remainingSec: undefined, paused: true, completed: false };
+    }
+
+    function makeDefaultAssignments() {
+      const waiters = {};
+      for (let i = 1; i <= 8; i++) {
+        waiters[i] = { waiterId: i, displayName: \`Waiter \${i}\`, webhookUrl: "" };
+      }
+      return { tableWaiterMap: Array.from({ length: DEFAULT_TABLE_COUNT }, () => 0), waiters };
+    }
+
+    function loadCourses() {
+      const raw = localStorage.getItem(LS_KEYS.COURSES);
+      if (!raw) return [makeDefaultCourse()];
+      try { return JSON.parse(raw); } catch { return [makeDefaultCourse()]; }
+    }
+
+    function saveCourses(courses) {
+      localStorage.setItem(LS_KEYS.COURSES, JSON.stringify(courses));
+    }
+
+    function loadTables() {
+      const raw = localStorage.getItem(LS_KEYS.TABLES);
+      if (!raw) return Array.from({ length: DEFAULT_TABLE_COUNT }, (_, i) => makeDefaultTableState(i));
+      try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed) || parsed.length !== DEFAULT_TABLE_COUNT) throw new Error("bad tables");
+        return parsed;
+      } catch {
+        return Array.from({ length: DEFAULT_TABLE_COUNT }, (_, i) => makeDefaultTableState(i));
+      }
+    }
+
+    function saveTables(tables) {
+      localStorage.setItem(LS_KEYS.TABLES, JSON.stringify(tables));
+    }
+
+    function loadAssignments() {
+      const raw = localStorage.getItem(LS_KEYS.ASSIGN);
+      if (!raw) return makeDefaultAssignments();
+      try { return JSON.parse(raw); } catch { return makeDefaultAssignments(); }
+    }
+
+    function saveAssignments(asg) {
+      localStorage.setItem(LS_KEYS.ASSIGN, JSON.stringify(asg));
+    }
+
+    function formatHMS(totalSec = 0) {
+      const s = Math.max(0, Math.floor(totalSec));
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const ss = s % 60;
+      if (h > 0) return \`\${h}:\${String(m).padStart(2, "0")}:\${String(ss).padStart(2, "0")}\`;
+      return \`\${m}:\${String(ss).padStart(2, "0")}\`;
+    }
+
+    function clamp(n, min, max) { return Math.min(max, Math.max(min, n)); }
+    function classNames(...xs) { return xs.filter(Boolean).join(" "); }
+
+    async function sendIFTTT(webhookUrl, message, tableLabel, statusName) {
+      if (!webhookUrl) return { ok: false, error: "No webhook configured" };
+      try {
+        const res = await fetch(webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            value1: message || \`\${statusName} alert\`,
+            value2: \`\${tableLabel} – \${statusName}\`,
+            value3: new Date().toISOString(),
+          }),
+        });
+        return { ok: res.ok, status: res.status };
+      } catch (e) {
+        return { ok: false, error: String(e) };
+      }
+    }
+
+    function computeCurrentTimer(ts, status) {
+      if (!status) return { display: "--:--", currentRemaining: 0, elapsed: 0, warn: false, over: false, pct: 0 };
+
+      const now = Date.now();
+      const startedAt = ts.startedAt ?? now;
+      const elapsedMs = Math.max(0, now - startedAt);
+      const elapsed = Math.floor(elapsedMs / 1000);
+
+      if (status.mode === "countdown") {
+        const total = Math.max(0, status.durationSec ?? 0);
+        const remaining = clamp((ts.paused ? (ts.remainingSec ?? total) : total - elapsed), 0, total);
+        const warn = typeof status.alertAtSec === "number" && remaining <= status.alertAtSec && total > 0;
+        const over = remaining === 0 && total > 0;
+        const pct = total > 0 ? (remaining / total) : 0;
+        return { display: formatHMS(remaining), currentRemaining: remaining, elapsed, warn, over, pct };
+      } else {
+        const alertAt = Math.max(0, status.alertAtSec ?? 0);
+        const warn = elapsed >= alertAt && alertAt > 0;
+        const over = false;
+        const pct = alertAt > 0 ? clamp(elapsed / alertAt, 0, 1) : 0.25;
+        return { display: formatHMS(elapsed), currentRemaining: 0, elapsed, warn, over, pct };
+      }
+    }
+
+    function advanceTime(ts, courses) {
+      const course = courses.find(c => c.id === ts.courseId);
+      const status = course?.statuses?.[ts.statusIndex];
+      if (!status || ts.paused) return ts;
+
+      const { currentRemaining, elapsed } = computeCurrentTimer(ts, status);
+
+      const alertedKey = \`KHS_ALERTED_\${ts.tableIndex}_\${ts.statusIndex}\`;
+      const alerted = sessionStorage.getItem(alertedKey) === "1";
+      if (!alerted) {
+        const shouldAlert = (status.mode === "countdown" && typeof status.alertAtSec === "number" && currentRemaining <= status.alertAtSec)
+          || (status.mode === "timer" && typeof status.alertAtSec === "number" && elapsed >= status.alertAtSec);
+        if (shouldAlert) {
+          sessionStorage.setItem(alertedKey, "1");
+          triggerAutoAlert(ts.tableIndex, status);
+        }
+      }
+
+      if (status.mode === "countdown" && currentRemaining === 0 && (status.durationSec ?? 0) > 0) {
+        return nextStatus(ts, courses);
+      }
+
+      return ts;
+    }
+
+    async function triggerAutoAlert(tableIndex, status) {
+      try {
+        const assign = JSON.parse(localStorage.getItem(LS_KEYS.ASSIGN) || "null") || makeDefaultAssignments();
+        const waiterId = assign.tableWaiterMap[tableIndex] || 0;
+        const waiter = assign.waiters[waiterId];
+        const label = \`Table \${tableIndex + 1}\`;
+        await sendIFTTT(waiter?.webhookUrl, status?.message || \`Alert for \${label}\`, label, status?.status || "");
+      } catch {}
+    }
+
+    function nextStatus(ts, courses) {
+      const course = courses.find(c => c.id === ts.courseId);
+      if (!course) return ts;
+      const nextIndex = ts.statusIndex + 1;
+      if (nextIndex >= course.statuses.length) {
+        return { ...ts, statusIndex: course.statuses.length - 1, paused: true, completed: true };
+      }
+      const nextSt = course.statuses[nextIndex];
+      const startedAt = Date.now();
+      const remainingSec = nextSt.mode === "countdown" ? (nextSt.durationSec ?? 0) : undefined;
+      try { sessionStorage.removeItem(\`KHS_ALERTED_\${ts.tableIndex}_\${nextIndex}\`); } catch {}
+      return { ...ts, statusIndex: nextIndex, startedAt, remainingSec, paused: false, completed: false };
+    }
+
+    function useInterval(ms) {
+      const [tick, setTick] = useState(0);
+      useEffect(() => {
+        const id = setInterval(() => setTick(t => t + 1), ms);
+        return () => clearInterval(id);
+      }, [ms]);
+      return tick;
+    }
+
+    function classJoin(...xs){ return xs.filter(Boolean).join(" "); }
+
+    function Header({ tab, setTab }) {
+      return (
+        <header className="sticky top-0 z-10 bg-neutral-900/80 backdrop-blur border-b border-neutral-800">
+          <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-3">
+            <div className="text-xl font-bold tracking-wide">Kitchen Timer System</div>
+            <div className="ml-auto flex gap-2">
+              <NavButton active={tab === "front"} onClick={() => setTab("front")}>Front</NavButton>
+              <NavButton active={tab === "setup"} onClick={() => setTab("setup")}>Setup</NavButton>
+              <NavButton active={tab === "waiters"} onClick={() => setTab("waiters")}>Waiters</NavButton>
+            </div>
+          </div>
+        </header>
+      );
+    }
+
+    function NavButton({ active, onClick, children }) {
+      return (
+        <button
+          className={classJoin(
+            "px-4 py-2 rounded-2xl text-sm font-medium",
+            active ? "bg-emerald-600 text-white" : "bg-neutral-800 hover:bg-neutral-700"
+          )}
+          onClick={onClick}
+        >{children}</button>
+      );
+    }
+
+    function NumberInput({ label, value, onChange, min = 0, max = 86400 }) {
+      return (
+        <label className="text-xs text-neutral-300 flex items-center gap-1">
+          <span className="opacity-80">{label}</span>
+          <input type="number" className="w-28 bg-neutral-800 rounded-xl px-2 py-1" value={value ?? 0} min={min} max={max} onChange={e => onChange(parseInt(e.target.value || "0", 10))} />
+        </label>
+      );
+    }
+
+    function StatusCircle({ warn, over, pct, label }) {
+      const color = over ? "bg-red-600" : warn ? "bg-amber-500" : "bg-emerald-600";
+      const inset = Math.max(6, 6 + (1 - pct) * 42);
+      return (
+        <div className="relative w-24 h-24 shrink-0">
+          <div className="absolute inset-0 rounded-full bg-neutral-800" />
+          <div className="absolute inset-[6px] rounded-full bg-neutral-900 border border-neutral-700" />
+          <div className={\`absolute rounded-full \${color}\`} style={{ inset: \`\${inset}px\` }} />
+          <div className="absolute inset-0 grid place-items-center text-center px-2 text-xs leading-tight">
+            <div>{label}</div>
+          </div>
+        </div>
+      );
+    }
+
+    function computeCurrent(ts, status) { return computeCurrentTimer(ts, status); }
+
+    function FrontPage({ courses, tables, assign, onTablesChange, onResetTable }) {
+      const courseMap = useMemo(() => Object.fromEntries(courses.map(c => [c.id, c])), [courses]);
+
+      function updateTable(idx, patch) {
+        onTablesChange(prev => prev.map(t => t.tableIndex === idx ? { ...t, ...patch } : t));
+      }
+
+      async function handleCallWaiter(idx) {
+        const t = tables[idx];
+        const course = t.courseId ? courseMap[t.courseId] : undefined;
+        const status = course?.statuses?.[t.statusIndex];
+        const wId = assign.tableWaiterMap[idx] || 0;
+        const waiter = assign.waiters[wId];
+        const label = \`Table \${idx + 1}\`;
+        const res = await sendIFTTT(waiter?.webhookUrl, status?.message || \`Call waiter to \${label}\`, label, status?.status || "");
+        alert(res.ok ? \`✅ Notified \${waiter?.displayName || "Waiter"}\` : \`⚠️ Failed: \${res.error || res.status}\`);
+      }
+
+      function handleNext(idx) {
+        onTablesChange(prev => prev.map(ts => ts.tableIndex === idx ? nextStatus(ts, courses) : ts));
+      }
+
+      function handleStartPause(idx) {
+        const t = tables[idx];
+        const course = t.courseId ? courseMap[t.courseId] : undefined;
+        const status = course?.statuses?.[t.statusIndex];
+        const now = Date.now();
+
+        if (!status) return;
+        if (t.paused) {
+          let startedAt = now;
+          if (status.mode === "countdown") {
+            const remain = t.remainingSec ?? status.durationSec ?? 0;
+            startedAt = now - ((status.durationSec ?? 0) - remain) * 1000;
+          }
+          updateTable(idx, { paused: false, startedAt, completed: false });
+        } else {
+          const { currentRemaining } = computeCurrentTimer(t, status);
+          updateTable(idx, { paused: true, remainingSec: currentRemaining });
+        }
+      }
+
+      function handleCourseChange(idx, courseId) {
+        updateTable(idx, { ...makeDefaultTableState(idx), courseId });
+      }
+
+      return (
+        <div className="max-w-7xl mx-auto px-3 py-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 xl:grid-cols-2 gap-4">
+            {tables.map((t, i) => {
+              const course = t.courseId ? courses.find(c => c.id === t.courseId) : undefined;
+              const status = course?.statuses?.[t.statusIndex];
+              const { display, warn, over, pct } = computeCurrent(t, status);
+              const waiterId = assign.tableWaiterMap[i] || 0;
+              const waiterName = waiterId ? assign.waiters[waiterId]?.displayName : "None";
+              return (
+                <div key={i} className="bg-neutral-900 rounded-2xl border border-neutral-800 p-4 flex flex-col gap-3">
+                  <div className="flex items-center gap-2">
+                    <div className="text-lg font-semibold">Table {i + 1}</div>
+                    <span className="text-xs ml-2 px-2 py-0.5 rounded-full bg-neutral-800">Waiter: {waiterName || "None"}</span>
+                    <button className="ml-auto text-xs px-3 py-1 rounded-full bg-neutral-800 hover:bg-neutral-700" onClick={() => onResetTable(i)}>Reset</button>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <select
+                      className="bg-neutral-800 rounded-xl px-3 py-2 text-sm outline-none w-full"
+                      value={t.courseId || ""}
+                      onChange={e => handleCourseChange(i, e.target.value || undefined)}
+                    >
+                      <option value="">Select Course</option>
+                      {courses.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                    </select>
+                  </div>
+
+                  <div className="flex items-center gap-4">
+                    <StatusCircle warn={warn} over={over} pct={pct} label={status ? status.status : "Idle"} />
+                    <div className="flex-1">
+                      <div className="text-2xl font-mono">{display}</div>
+                      <div className="text-sm text-neutral-400">{status ? (status.mode === "countdown" ? "Countdown" : "Timer") : "No course selected"}</div>
+                    </div>
+                  </div>
+
+                  <div className="flex gap-2 mt-2">
+                    <button className={classJoin("flex-1 py-3 rounded-xl font-semibold", t.paused ? "bg-emerald-600" : "bg-amber-600")}
+                            onClick={() => handleStartPause(i)}>
+                      {t.paused ? "Start/Resume" : "Pause"}
+                    </button>
+                    <button className="flex-1 py-3 rounded-xl bg-sky-600 font-semibold" onClick={() => handleNext(i)}>Next</button>
+                    <button className="flex-1 py-3 rounded-xl bg-fuchsia-600 font-semibold" onClick={() => handleCallWaiter(i)}>Call Waiter</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function SetupPage({ courses, setCourses }) {
+      const [selectedId, setSelectedId] = useState(courses[0]?.id);
+      const selected = useMemo(() => courses.find(c => c.id === selectedId) || courses[0], [courses, selectedId]);
+
+      function updateSelected(patch) {
+        setCourses(prev => prev.map(c => c.id === selected.id ? { ...c, ...patch } : c));
+      }
+
+      function updateStatus(idx, patch) {
+        const next = [...selected.statuses];
+        next[idx] = { ...next[idx], ...patch };
+        updateSelected({ statuses: next });
+      }
+
+      function addStatus() {
+        if (selected.statuses.length >= MAX_STATUSES) return alert(\`Max \${MAX_STATUSES} statuses\`);
+        updateSelected({
+          statuses: [...selected.statuses, { id: makeId("st"), status: "New", mode: "timer", alertAtSec: 60, message: "Status alert" }],
+        });
+      }
+
+      function removeStatus(idx) {
+        const next = selected.statuses.filter((_, i) => i !== idx);
+        updateSelected({ statuses: next });
+      }
+
+      function move(idx, dir) {
+        const j = idx + dir;
+        if (j < 0 || j >= selected.statuses.length) return;
+        const arr = [...selected.statuses];
+        [arr[idx], arr[j]] = [arr[j], arr[idx]];
+        updateSelected({ statuses: arr });
+      }
+
+      function addCourse() {
+        const c = makeDefaultCourse();
+        setCourses(prev => [...prev, { ...c, name: \`Course \${prev.length + 1}\` }]);
+        setSelectedId(c.id);
+      }
+
+      function deleteCourse() {
+        if (!confirm("Delete this course?")) return;
+        const remaining = courses.filter(c => c.id !== selected.id);
+        setCourses(remaining.length ? remaining : [makeDefaultCourse()]);
+        setSelectedId(remaining[0]?.id || makeDefaultCourse().id);
+      }
+
+      return (
+        <div className="max-w-5xl mx-auto px-3 py-6">
+          <div className="flex items-center gap-2 mb-4">
+            <select className="bg-neutral-800 rounded-xl px-3 py-2" value={selected.id} onChange={e => setSelectedId(e.target.value)}>
+              {courses.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+            <input className="bg-neutral-800 rounded-xl px-3 py-2 flex-1" value={selected.name} onChange={e => updateSelected({ name: e.target.value })} />
+            <button className="px-3 py-2 rounded-xl bg-emerald-600" onClick={addCourse}>New Course</button>
+            <button className="px-3 py-2 rounded-xl bg-red-600" onClick={deleteCourse}>Delete</button>
+          </div>
+
+          <div className="space-y-3">
+            {selected.statuses.map((st, i) => (
+              <div key={st.id} className="bg-neutral-900 rounded-2xl border border-neutral-800 p-3">
+                <div className="flex items-center gap-2 mb-2">
+                  <div className="text-sm px-2 py-1 rounded bg-neutral-800">#{i + 1}</div>
+                  <input className="bg-neutral-800 rounded-xl px-3 py-2" value={st.status} onChange={e => updateStatus(i, { status: e.target.value })} />
+                  <select className="bg-neutral-800 rounded-xl px-3 py-2" value={st.mode} onChange={e => updateStatus(i, { mode: e.target.value })}>
+                    <option value="timer">Timer (count up)</option>
+                    <option value="countdown">Countdown</option>
+                  </select>
+                  {st.mode === "countdown" && (
+                    <>
+                      <NumberInput label="Duration (sec)" value={st.durationSec ?? 0} min={0} onChange={v => updateStatus(i, { durationSec: v })} />
+                      <NumberInput label="Alert at (sec remaining)" value={st.alertAtSec ?? 0} min={0} onChange={v => updateStatus(i, { alertAtSec: v })} />
+                    </>
+                  )}
+                  {st.mode === "timer" && (
+                    <NumberInput label="Alert at (elapsed sec)" value={st.alertAtSec ?? 0} min={0} onChange={v => updateStatus(i, { alertAtSec: v })} />
+                  )}
+                  <input className="bg-neutral-800 rounded-xl px-3 py-2 flex-1" placeholder="IFTTT message" value={st.message || ""} onChange={e => updateStatus(i, { message: e.target.value })} />
+                  <div className="ml-auto flex gap-2">
+                    <button className="px-3 py-2 rounded-xl bg-neutral-800" onClick={() => move(i, -1)}>↑</button>
+                    <button className="px-3 py-2 rounded-xl bg-neutral-800" onClick={() => move(i, +1)}>↓</button>
+                    <button className="px-3 py-2 rounded-xl bg-red-600" onClick={() => removeStatus(i)}>Remove</button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-4">
+            <button className="px-4 py-3 rounded-2xl bg-sky-600" onClick={addStatus}>+ Add Status</button>
+          </div>
+        </div>
+      );
+    }
+
+    function WaitersPage({ assign, setAssign }) {
+      function setWaiterField(id, patch) {
+        setAssign(prev => ({ ...prev, waiters: { ...prev.waiters, [id]: { ...prev.waiters[id], ...patch } } }));
+      }
+      function setTableWaiter(idx, waiterId) {
+        setAssign(prev => ({ ...prev, tableWaiterMap: prev.tableWaiterMap.map((w, i) => i === idx ? waiterId : w) }));
+      }
+
+      async function testWebhook(id) {
+        const w = assign.waiters[id];
+        const res = await sendIFTTT(w.webhookUrl, \`Test ping for \${w.displayName}\`, "Table X", "Test");
+        alert(res.ok ? "✅ Webhook OK" : \`⚠️ \${res.error || res.status}\`);
+      }
+
+      return (
+        <div className="max-w-6xl mx-auto px-3 py-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className="bg-neutral-900 rounded-2xl border border-neutral-800 p-4">
+            <div className="text-lg font-semibold mb-3">Waiter Webhooks (1–8)</div>
+            <div className="space-y-3">
+              {Array.from({ length: 8 }, (_, i) => i + 1).map(id => {
+                const w = assign.waiters[id];
+                return (
+                  <div key={id} className="bg-neutral-950 rounded-xl p-3 border border-neutral-800">
+                    <div className="flex items-center gap-2 mb-2">
+                      <div className="text-sm px-2 py-1 rounded bg-neutral-800">#{id}</div>
+                      <input className="bg-neutral-800 rounded-xl px-3 py-2 flex-1" value={w.displayName} onChange={e => setWaiterField(id, { displayName: e.target.value })} />
+                      <button className="px-3 py-2 rounded-xl bg-sky-600" onClick={() => testWebhook(id)}>Test</button>
+                    </div>
+                    <input className="w-full bg-neutral-800 rounded-xl px-3 py-2" placeholder="Full IFTTT webhook URL (e.g., https://maker.ifttt.com/trigger/your_event/with/key/your_key)" value={w.webhookUrl} onChange={e => setWaiterField(id, { webhookUrl: e.target.value })} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="bg-neutral-900 rounded-2xl border border-neutral-800 p-4">
+            <div className="text-lg font-semibold mb-3">Assign Waiters to Tables</div>
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+              {Array.from({ length: DEFAULT_TABLE_COUNT }, (_, i) => (
+                <div key={i} className="bg-neutral-950 rounded-xl p-3 border border-neutral-800 flex items-center gap-2">
+                  <div className="text-sm w-16">Table {i + 1}</div>
+                  <select className="bg-neutral-800 rounded-xl px-3 py-2 flex-1" value={assign.tableWaiterMap[i] || 0} onChange={e => setTableWaiter(i, parseInt(e.target.value, 10))}>
+                    <option value={0}>None</option>
+                    {Array.from({ length: 8 }, (_, j) => j + 1).map(id => (
+                      <option key={id} value={id}>{assign.waiters[id]?.displayName || \`Waiter \${id}\`}</option>
+                    ))}
+                  </select>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function KitchenTimerSystem() {
+      const [tab, setTab] = React.useState("front");
+      const [courses, setCourses] = React.useState(loadCourses);
+      const [tables, setTables] = React.useState(loadTables);
+      const [assign, setAssign] = React.useState(loadAssignments);
+      const tick = useInterval(1000);
+
+      React.useEffect(() => saveCourses(courses), [courses]);
+      React.useEffect(() => saveTables(tables), [tables]);
+      React.useEffect(() => saveAssignments(assign), [assign]);
+
+      React.useEffect(() => {
+        setTables(prev => prev.map(ts => advanceTime(ts, courses)));
+      }, [tick]);
+
+      return (
+        <div className="min-h-screen bg-neutral-950 text-neutral-100 p-safe pb-24">
+          <Header tab={tab} setTab={setTab} />
+          {tab === "front" && (
+            <FrontPage
+              courses={courses}
+              tables={tables}
+              assign={assign}
+              onTablesChange={setTables}
+              onResetTable={(i) => setTables(prev => prev.map(t => t.tableIndex === i ? makeDefaultTableState(i) : t))}
+            />
+          )}
+          {tab === "setup" && (
+            <SetupPage courses={courses} setCourses={setCourses} />
+          )}
+          {tab === "waiters" && (
+            <WaitersPage assign={assign} setAssign={setAssign} />
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<KitchenTimerSystem />);
+  </script>
+</body>
+</html>
